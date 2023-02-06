@@ -57,6 +57,7 @@ struct Network_Device
 
 static int socket_desc = 0;
 static bool verbose_debug = 0;
+static bool raw_enable = 0;
 static int PCAP_SNAPLEN_MAX = 65535;
 static int max_packet_len = PCAP_SNAPLEN_MAX;
 
@@ -135,6 +136,18 @@ void list_network_devices()
     }
 }
 
+
+void create_raw_socket()
+{
+    /* Create socket descriptor */
+    socket_desc = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (socket_desc == -1)
+    {
+        fprintf(stderr, "Couldn't create socket descriptor\n");
+        exit(1);
+    }
+}
+
 void create_socket()
 {
 
@@ -185,43 +198,6 @@ void create_socket()
     {
         perror("setsockopt (SO_BROADCAST)");
         exit(1);
-    }
-
-    /* Set socket address attributes for destination points */
-    for (unsigned i = 0; i < destination_points.size(); i++)
-    {
-        struct hostent *dest_host_info = gethostbyname(
-                destination_points[i].dest_addr);
-
-        if (!dest_host_info)
-        {
-            fprintf(stderr, "gethostbyname(%s) failed\n",
-                   destination_points[i].dest_addr);
-            exit(1);
-        }
-
-        destination_points[i].dest_sock_addr.sin_family = AF_INET;
-        destination_points[i].dest_sock_addr.sin_port = htons(
-                destination_points[i].dest_port);
-        memcpy(&destination_points[i].dest_sock_addr.sin_addr,
-               dest_host_info->h_addr, dest_host_info->h_length);
-
-        if (verbose_debug)
-        {
-            printf("  dest address: %s:%i\n", destination_points[i].dest_addr,
-                    destination_points[i].dest_port);
-        }
-    }
-
-    if (verbose_debug)
-    {
-        printf("source address: %s:%i\n", source_addr, source_port);
-
-        if (source_bind_port != 0)
-        {
-            printf("reflector socket bound to local port: %i\n",
-                    source_bind_port);
-        }
     }
 }
 
@@ -280,15 +256,79 @@ void print_usage()
     printf("\n");
 }
 
+/**
+ * Function to calculate checksum
+ */
+uint16_t in_cksum(uint16_t *addr, int len)
+{
+  int nleft = len;
+  uint32_t sum = 0;
+  uint16_t *w = addr;
+  uint16_t answer = 0;
+
+  // Adding 16 bits sequentially in sum
+  while (nleft > 1) {
+    sum += *w;
+    nleft -= 2;
+    w++;
+  }
+
+  // If an odd byte is left
+  if (nleft == 1) {
+    *(unsigned char *) (&answer) = *(unsigned char *) w;
+    sum += answer;
+  }
+
+  sum = (sum >> 16) + (sum & 0xffff);
+  sum += (sum >> 16);
+  answer = ~sum;
+
+  return answer;
+}
+
+
+
+static unsigned short udp_cksum(struct iphdr* ip_hdr, struct udphdr* udp, int len) {
+        struct pseudo_header {
+                uint32_t source_address;
+                uint32_t dest_address;
+                uint8_t placeholder;
+                uint8_t protocol;
+                uint16_t udp_length;
+        };
+
+
+        int psize = sizeof(struct pseudo_header) + len;
+        char *pseudogram = (char *) malloc(psize);
+        
+        struct pseudo_header* psh = (struct pseudo_header*) pseudogram;
+
+        psh->source_address = ip_hdr->saddr;
+        psh->dest_address = ip_hdr->daddr;
+        psh->placeholder = 0;
+        psh->protocol = IPPROTO_UDP;
+        psh->udp_length = htons(len);
+
+        memcpy(pseudogram + sizeof(struct pseudo_header), udp, len);
+
+        unsigned short output = in_cksum((unsigned short *) pseudogram, psize);
+
+        free(pseudogram);
+
+        return output;
+}
+
 static void process_packet(u_char *x, const struct pcap_pkthdr *header,
         const u_char *packet)
 {
     struct udphdr *udp_hdr = (struct udphdr *) (packet
             + sizeof(struct ether_header) + sizeof(struct iphdr) + tweak_offset);
 
+    struct iphdr *ip_hdr = (struct iphdr *) (packet + sizeof(struct ether_header) + tweak_offset);
+
     bool ignore_packet = false;
     int bytes_sent;
-    int udp_len;
+    uint32_t udp_len, udp_len2;
 
     /* Determine if the packet should be ignored */
     for (unsigned j = 0; j < ignore_ports.size(); j++)
@@ -308,6 +348,7 @@ static void process_packet(u_char *x, const struct pcap_pkthdr *header,
 
     if (ignore_packet)
         return;
+    
 
 /*    printf("-- detected %d IP msg bytes, hex:", header->len);
     for (int i = 0; i < header->len; i++ )
@@ -319,17 +360,26 @@ static void process_packet(u_char *x, const struct pcap_pkthdr *header,
     printf(".\n");*/
 
     udp_len = header->len - DATA_OFFSET - tweak_offset;
-    udp_hdr->len = ntohs(udp_hdr->len);
-    if (udp_hdr->len-8 < udp_len)
-        udp_len = udp_hdr->len-8;
+    udp_len2 = ntohs(udp_hdr->len);
+    if (udp_len2-sizeof(struct udphdr) < udp_len)
+        udp_len = udp_len2-sizeof(struct udphdr);
 //    printf("-- UDP length detected as %d\n", udp_len);
 
     /* Send UDP packet to each destination point */
     for (unsigned i = 0; i < destination_points.size(); i++)
     {
+        if(raw_enable){
+            ip_hdr->daddr = *(uint32_t*)&destination_points[i].dest_sock_addr.sin_addr;
+            ip_hdr->check = in_cksum((unsigned short *)ip_hdr, sizeof(struct iphdr));
+
+            udp_hdr->dest = htons(destination_points[i].dest_port);
+            udp_hdr->check = 0;
+            udp_hdr->check = udp_cksum(ip_hdr, udp_hdr, sizeof(struct udphdr) + udp_len);
+        }
+
         bytes_sent = sendto(socket_desc,
-                (const char *) packet + DATA_OFFSET + tweak_offset,
-                udp_len,
+                (const char *) packet + (raw_enable ? sizeof(struct ether_header) : DATA_OFFSET) + tweak_offset,
+                udp_len + (raw_enable ? (sizeof(struct iphdr) + sizeof(struct udphdr)) : 0),
                 0,
                 (struct sockaddr *) &destination_points[i].dest_sock_addr,
                 sizeof(destination_points[i].dest_sock_addr));
@@ -462,6 +512,10 @@ int main(int argc, char *argv[])
             case 'v':
                 verbose_debug = true;
                 break;
+            case 'r':
+                raw_enable = true;
+                break;
+
 
             /* list network devices */
             case 'l':
@@ -524,7 +578,48 @@ int main(int argc, char *argv[])
     }
 
     /* Create reflector socket */
-    create_socket();
+    if(raw_enable){
+        create_raw_socket();
+    } else {
+        create_socket();
+    }
+
+    /* Set socket address attributes for destination points */
+    for (unsigned i = 0; i < destination_points.size(); i++)
+    {
+        struct hostent *dest_host_info = gethostbyname(
+                destination_points[i].dest_addr);
+
+        if (!dest_host_info)
+        {
+            fprintf(stderr, "gethostbyname(%s) failed\n",
+                   destination_points[i].dest_addr);
+            exit(1);
+        }
+
+        destination_points[i].dest_sock_addr.sin_family = AF_INET;
+        destination_points[i].dest_sock_addr.sin_port = htons(
+                destination_points[i].dest_port);
+        memcpy(&destination_points[i].dest_sock_addr.sin_addr,
+               dest_host_info->h_addr, dest_host_info->h_length);
+
+        if (verbose_debug)
+        {
+            printf("  dest address: %s:%i\n", destination_points[i].dest_addr,
+                    destination_points[i].dest_port);
+        }
+    }
+
+    if (verbose_debug)
+    {
+        printf("source address: %s:%i\n", source_addr, source_port);
+
+        if (source_bind_port != 0)
+        {
+            printf("reflector socket bound to local port: %i\n",
+                    source_bind_port);
+        }
+    }
 
     /* Register pcap_handler callback */
     pcap_loop(pcap_handle, 0, process_packet, NULL);
