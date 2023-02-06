@@ -3,7 +3,7 @@
  *
  *  Copyright (C) 2011 Harlan Murphy
  *  Orbis Software - orbisoftware@gmail.com
- *  
+ *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
  *  the Free Software Foundation, either version 3 of the License, or
@@ -16,7 +16,7 @@
 
  *  You should have received a copy of the GNU General Public License
  *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *   
+ *
  */
 
 #ifdef WIN32
@@ -38,7 +38,7 @@
 #include <netinet/udp.h>
 #include <vector>
 #include <string.h>
-   
+
 using namespace std;
 
 struct UDP_Destination
@@ -70,8 +70,9 @@ static vector<unsigned short> ignore_ports;
 static vector<Network_Device> network_devices;
 
 /* Data offset within raw ethernet frame */
-static const int DATA_OFFSET = sizeof(struct ether_header) + 
+static const int DATA_OFFSET = sizeof(struct ether_header) +
    sizeof(struct iphdr) + sizeof(struct udphdr);
+static int tweak_offset = 0;
 
 void enumerate_devices()
 {
@@ -96,6 +97,7 @@ void enumerate_devices()
         Network_Device net_dev;
         strcpy(net_dev.device_name, dev->name);
 
+        net_dev.device_desc[0] = '\0';
         if (dev->description)
             strcpy(net_dev.device_desc, dev->description);
 
@@ -201,10 +203,8 @@ void create_socket()
         destination_points[i].dest_sock_addr.sin_family = AF_INET;
         destination_points[i].dest_sock_addr.sin_port = htons(
                 destination_points[i].dest_port);
-        //strncpy((char *) &destination_points[i].dest_sock_addr.sin_addr,
-        //        (char *) dest_host_info->h_addr, dest_host_info->h_length);
-        struct in_addr **addr_list = (struct in_addr **)dest_host_info->h_addr_list; 
-        memcpy( &destination_points[i].dest_sock_addr.sin_addr.s_addr, &(addr_list[0]->s_addr),4);
+        memcpy(&destination_points[i].dest_sock_addr.sin_addr,
+               dest_host_info->h_addr, dest_host_info->h_length);
 
         if (verbose_debug)
         {
@@ -237,6 +237,7 @@ void print_usage()
     printf("ports which are used to prevent the infinite looping of packets between\n");
     printf("multiple udp_reflectors.\n");
     printf("\n");
+    printf("   -e, assume no ethernet header on frame (e.g. for VPN tun interfaces)\n");
     printf("   -s, source pcap interface and port\n");
     printf("   -d, destination ip address and port\n");
     printf("   -b, bind reflector socket to a specific source port (defaults to nonbinding)\n");
@@ -283,11 +284,12 @@ static void process_packet(u_char *x, const struct pcap_pkthdr *header,
         const u_char *packet)
 {
     struct udphdr *udp_hdr = (struct udphdr *) (packet
-            + sizeof(struct ether_header) + sizeof(struct iphdr));
+            + sizeof(struct ether_header) + sizeof(struct iphdr) + tweak_offset);
 
     bool ignore_packet = false;
     int bytes_sent;
-    
+    int udp_len;
+
     /* Determine if the packet should be ignored */
     for (unsigned j = 0; j < ignore_ports.size(); j++)
     {
@@ -307,11 +309,28 @@ static void process_packet(u_char *x, const struct pcap_pkthdr *header,
     if (ignore_packet)
         return;
 
+/*    printf("-- detected %d IP msg bytes, hex:", header->len);
+    for (int i = 0; i < header->len; i++ )
+    {
+        if ( (i&0xf)==0 )
+            printf("\n-- ");
+        printf(" %02x", packet[i]);
+    }
+    printf(".\n");*/
+
+    udp_len = header->len - DATA_OFFSET - tweak_offset;
+    udp_hdr->len = ntohs(udp_hdr->len);
+    if (udp_hdr->len-8 < udp_len)
+        udp_len = udp_hdr->len-8;
+//    printf("-- UDP length detected as %d\n", udp_len);
+
     /* Send UDP packet to each destination point */
     for (unsigned i = 0; i < destination_points.size(); i++)
     {
-        bytes_sent = sendto(socket_desc, (const char *) packet + DATA_OFFSET,
-                header->len - DATA_OFFSET, 0,
+        bytes_sent = sendto(socket_desc,
+                (const char *) packet + DATA_OFFSET + tweak_offset,
+                udp_len,
+                0,
                 (struct sockaddr *) &destination_points[i].dest_sock_addr,
                 sizeof(destination_points[i].dest_sock_addr));
 
@@ -379,6 +398,11 @@ int main(int argc, char *argv[])
         {
             switch (argv[1][1])
             {
+            /* Assume there's no Ethernet header in the message */
+            case 'e':
+                tweak_offset = -int(sizeof(struct ether_header));
+                break;
+
             /* Source network interface and port */
             case 's':
                 pcap_dev = strtok(&argv[1][3], ":");
@@ -387,7 +411,7 @@ int main(int argc, char *argv[])
                 {
                     if (strncmp(pcap_dev, "pcap", 4) != 0)
                     {
-                        fprintf(stderr, "Invalid source pcap interface");
+                        fprintf(stderr, "Invalid source pcap interface (see -l for a list of available interfaces)");
                         exit(1);
                     }
 
@@ -405,8 +429,8 @@ int main(int argc, char *argv[])
 
                     /* Save source port and create filter expression */
                     source_port_str = strtok(NULL, "\r\n");
-                    strcpy(&filter_exp[0], "udp and port ");
-                    strcpy(&filter_exp[13], source_port_str);
+                    strcpy(&filter_exp[0], "udp and udp dst port ");
+                    strcpy(&filter_exp[21], source_port_str);
                     source_port = atoi(source_port_str);
                 }
                 break;
@@ -414,6 +438,7 @@ int main(int argc, char *argv[])
             /* Destination ip address and port */
             case 'd':
                 struct UDP_Destination udp_dest;
+                memset((char*)&udp_dest, 0, sizeof(udp_dest));
 
                 udp_dest.dest_addr = strtok(&argv[1][3], ":");
 
@@ -479,6 +504,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Couldn't open device %s: %s\n", network_dev, errbuf);
         exit(1);
     }
+
+    pcap_setdirection(pcap_handle, PCAP_D_IN);
 
     /* Compile the filter */
     if (pcap_compile(pcap_handle, &bpf_filter, filter_exp, 0, netaddr) == -1)
